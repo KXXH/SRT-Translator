@@ -18,9 +18,13 @@ SYSTEM_PROMPT = """我需要你帮忙翻译一些SRT字幕内容。下面是一�
 
 需要你翻译的字幕如下：
 
-[字幕内容]
+<content>
 
-按照以上的规则和示例，请开始你的翻译，并输出符合要求的翻译结果。\n\n"""
+现在，补完下列翻译:
+
+<example>
+"""
+
 
 async def async_request(openai, prompt, model, semaphore):
     async with semaphore:
@@ -36,25 +40,43 @@ async def async_request(openai, prompt, model, semaphore):
         return res.choices[0].message.content
 
 
-
 def translate_srt(srt_data, api_key, **kwargs):
-    # openai = OpenAI(api_key=api_key, base_url=kwargs.get('base_url'))
-    openai = AsyncOpenAI(api_key=api_key, base_url=kwargs.get('base_url'))
+    # init params
+    openai = OpenAI(api_key=api_key, base_url=kwargs.get(
+        'base_url'), timeout=30, max_retries=3)
+    # openai = AsyncOpenAI(api_key=api_key, base_url=kwargs.get('base_url'))
     model = kwargs.get('model', 'gpt-3.5-turbo')
     window_size = kwargs.get('window_size', 10)
     step_size = kwargs.get('step_size', 10)
     wait_sec = kwargs.get('wait_sec', 1)
     lang_src = kwargs.get('lang_src', 'en')
     lang_tgt = kwargs.get('lang_tgt', 'zh')
+    debug = kwargs.get('debug', False)
+    padding = kwargs.get('padding', 0)
     max_tasks = asyncio.Semaphore(kwargs.get('max_tasks', 10))
-
     system_prompt = kwargs.get('system_prompt', SYSTEM_PROMPT)
     i = 0
     translated_srt = []
+
     while i < len(srt_data):
-        srt_to_translate = list(srt_data[i:i+window_size])
-        prompt = system_prompt.replace("<lang_src>", lang_src).replace("<lang_tgt>", lang_tgt).replace(
-            "<content>", "".join(map(lambda x: "{" + re.sub(r'[{<](.*?)[>}]|\n', '', x.content) + "}", srt_to_translate)))
+        has_front_padding = padding > 0 and i - padding > 0
+        has_back_padding = padding > 0 and i + \
+            WINDOW_SIZE + padding < len(srt_data)
+        start = max(0, i - padding) if has_front_padding else i
+        end = min(len(srt_data), i + WINDOW_SIZE +
+                  padding) if has_back_padding else i + WINDOW_SIZE
+        srt_to_translate = list(srt_data[start:end])
+        example_translate_srt = list(
+            translated_srt[start:i])  # [i - PADDING:i] or []
+
+        # build prompt and send request
+        prompt = system_prompt\
+            .replace("<lang_src>", lang_src)\
+            .replace("<lang_tgt>", lang_tgt)\
+            .replace("<content>", "".join(map(lambda x: "{" + re.sub(r'[{<](.*?)[>}]|\n', '', x.content) + "}", srt_to_translate)))\
+            .replace("<example>", "".join(map(lambda x: "{" + re.sub(r'[{<](.*?)[>}]|\n', '', x.content) + "}", example_translate_srt)))
+        if debug:
+            print(prompt)
         res = openai.chat.completions.create(
             messages=[
                 {
@@ -65,14 +87,30 @@ def translate_srt(srt_data, api_key, **kwargs):
             model=model
         )
         translate_raw_content = res.choices[0].message.content
+        if debug:
+            print(translate_raw_content)
+
+        # parse response and check if the length is correct
         splited_content = re.findall(
             r'{(.*?)}', translate_raw_content, re.DOTALL)
-        if len(splited_content) != len(srt_to_translate):
+        if len(splited_content) + len(example_translate_srt) != len(srt_to_translate):
             print(
-                f"splited_content length({len(splited_content)} does not equal to srt_to_translate length {len(srt_to_translate)}, retry...")
+                f"❌ splited_content length({len(splited_content)} + {len(example_translate_srt)}) does not equal to srt_to_translate length {len(srt_to_translate)}, retry...")
             time.sleep(wait_sec)
             continue
-        for origin, translate in zip(srt_to_translate, splited_content):
+        elif debug:
+            print(
+                f"✅ length check passed, progress: {i+window_size}/{len(srt_data)}")
+        
+        # build translated srt
+        payload_srt = srt_to_translate
+        if has_front_padding:
+            payload_srt = payload_srt[:]
+            splited_content = splited_content[:]
+        if has_back_padding:
+            payload_srt = payload_srt[:-padding]
+            splited_content = splited_content[:-padding]
+        for origin, translate in zip(payload_srt, splited_content):
             new_srt = srt.Subtitle(
                 index=origin.index, start=origin.start, end=origin.end, content=translate)
             translated_srt.append(new_srt)
@@ -87,7 +125,7 @@ if __name__ == "__main__":
 
     # 添加参数
     parser.add_argument("--api_key", required=True, help="API key for OpenAI.")
-    parser.add_argument("--base_url", required=True,
+    parser.add_argument("--base_url", default="https://api.openai.com/v1",
                         help="Base URL for OpenAI.")
     parser.add_argument("--srt_path", required=True,
                         help="Path to the SRT file to be translated.")
@@ -95,6 +133,8 @@ if __name__ == "__main__":
                         help="Window size for translation.")
     parser.add_argument("--step_size", default=10, type=int,
                         help="Step size for translation.")
+    parser.add_argument("--padding", default=0, type=int,
+                        help="Padding for translation.")
     parser.add_argument("--output_path", required=True,
                         help="Path to the output translated SRT file.")
     parser.add_argument("--lang_src", default="en",
@@ -105,12 +145,6 @@ if __name__ == "__main__":
     # 解析参数
     args = parser.parse_args()
 
-    # 使用参数
-    openai = OpenAI(
-        api_key=args.api_key,
-        base_url=args.base_url
-    )
-
     SRT_PATH = args.srt_path
     with open(SRT_PATH, 'r') as f:
         srt_data = list(srt.parse(f.read()))
@@ -119,7 +153,13 @@ if __name__ == "__main__":
     STEP_SIZE = args.step_size
 
     translated_srt = translate_srt(
-        srt_data, args.api_key, window_size=WINDOW_SIZE, step_size=STEP_SIZE)
+        srt_data, args.api_key,
+        window_size=WINDOW_SIZE,
+        step_size=STEP_SIZE,
+        padding=args.padding,
+        base_url=args.base_url,
+        debug=True,
+    )
 
     OUTPUT_PATH = args.output_path
     with open(OUTPUT_PATH, 'w') as f:
