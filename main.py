@@ -1,42 +1,60 @@
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 import srt
-import itertools
+import asyncio
 import time
 import re
 import argparse
 
 
-SYSTEM_PROMPT = """假设你是一名专业的翻译人员，请你将一段字幕翻译为中文。
-要求：
-1. 由于是字幕，因此在需要翻译的文字中可能会出现一些意料之外的换行。这些换行是为了保证字幕能正确地在屏幕上显示，你需要原样保留这些换行。
-2. 由于换行完全是出于格式目的，因此换行不代表一个句子的结束。无论如何，一个句子必定以“{”开始，以“}”结束。
-3. 我们使用“{“和”}”来表示一个句子的开始和结束。无论如何，一个句子必定以“{”开始，以“}”结束。
-4. 你是一名专业的翻译，因此你不能根据语气来自作主张地添加或删除大括号。你必须要保证每一个句子都被正确地大括号包裹。
-5. 遇到人名和地名无需翻译。
-6. 我们会给你小费，但是如果你的翻译不符合要求，我们会扣除小费。
-例子：
-输入：
-{I'm a translator.}{I'm a translator.}{Hello World}
-输出：
-{我是一名翻译人员。}{我是一名翻译人员。}{你好世界}
-下面，是你需要翻译的内容：\n\n"""
+SYSTEM_PROMPT = """我需要你帮忙翻译一些SRT字幕内容。下面是一些具体的要求：
+
+1. 每一条字幕都已经被大括号（{}）包裹，例如：{Hello, world!}。你需要在大括号内进行翻译，翻译后的内容也要放在相同的大括号中。
+2. 如果字幕中有换行，也请保留原样。
+3. 如果你遇到人名或地名，请直接保留，不要进行翻译。
+作为示例：如果原文字幕{Hello, world!\nMy name is John Doe.}需要从英语翻译为法语，结果应该是{Bonjour, le monde!\nMon nom est John Doe.}
+
+原语言：<lang_src>
+目标语言：<lang_tgt>
+
+需要你翻译的字幕如下：
+
+[字幕内容]
+
+按照以上的规则和示例，请开始你的翻译，并输出符合要求的翻译结果。\n\n"""
+
+async def async_request(openai, prompt, model, semaphore):
+    async with semaphore:
+        res = await openai.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model=model
+        )
+        return res.choices[0].message.content
+
 
 
 def translate_srt(srt_data, api_key, **kwargs):
-    openai = OpenAI(api_key=api_key, base_url=kwargs.get('base_url'))
+    # openai = OpenAI(api_key=api_key, base_url=kwargs.get('base_url'))
+    openai = AsyncOpenAI(api_key=api_key, base_url=kwargs.get('base_url'))
     model = kwargs.get('model', 'gpt-3.5-turbo')
     window_size = kwargs.get('window_size', 10)
     step_size = kwargs.get('step_size', 10)
     wait_sec = kwargs.get('wait_sec', 1)
+    lang_src = kwargs.get('lang_src', 'en')
+    lang_tgt = kwargs.get('lang_tgt', 'zh')
+    max_tasks = asyncio.Semaphore(kwargs.get('max_tasks', 10))
 
     system_prompt = kwargs.get('system_prompt', SYSTEM_PROMPT)
     i = 0
     translated_srt = []
     while i < len(srt_data):
         srt_to_translate = list(srt_data[i:i+window_size])
-        prompt = system_prompt + \
-            "".join(
-                map(lambda x: "{" + re.sub(r'{(.*?)}', '', x.content) + "}", srt_to_translate))
+        prompt = system_prompt.replace("<lang_src>", lang_src).replace("<lang_tgt>", lang_tgt).replace(
+            "<content>", "".join(map(lambda x: "{" + re.sub(r'[{<](.*?)[>}]|\n', '', x.content) + "}", srt_to_translate)))
         res = openai.chat.completions.create(
             messages=[
                 {
@@ -79,6 +97,10 @@ if __name__ == "__main__":
                         help="Step size for translation.")
     parser.add_argument("--output_path", required=True,
                         help="Path to the output translated SRT file.")
+    parser.add_argument("--lang_src", default="en",
+                        help="Source language.")
+    parser.add_argument("--lang_tgt", default="zh",
+                        help="Target language.")
 
     # 解析参数
     args = parser.parse_args()
